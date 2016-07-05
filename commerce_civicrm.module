@@ -89,7 +89,10 @@ function commerce_civicrm_display_contact_transactions($customer, $render = TRUE
 
   $output = _commerce_civicrm_display_customer_orders($customer);
   if ($render) {
-    print render($output);
+    $return = array(
+      'content' => render($output),
+    );
+    print json_encode($return);
   }
   else {
     return $output;
@@ -106,24 +109,29 @@ function commerce_civicrm_admin() {
   if (!civicrm_initialize()) {
     return;
   }
-  require_once 'api/v2/Group.php';
-  require_once 'CRM/Core/Config.php';
 
-  $params = array();
-  $groups = civicrm_group_get($params);
+  $groups = civicrm_api3('Group', 'get', array(
+    'sequential' => 1,
+    'is_active' => 1,
+  ));
+  $groups = $groups['values'];
+
   $options = array();
   foreach ($groups as $group) {
     $options[$group['id']] = $group['title'];
   }
-  natsort(&$options);
+  natsort($options);
 
   // Get contribution types.
   // Note, no {} on table name because it's in civicrm db.
-  $sql = "SELECT id, name FROM civicrm_contribution_type WHERE is_active = 1";
-  $dao =& CRM_Core_DAO::executeQuery($sql, array());
+  $financialTypes = civicrm_api3('FinancialType', 'get', array(
+    'sequential' => 1,
+    'is_active' => 1,
+  ));
+  $financialTypes = $financialTypes['values'];
   $types = array(0 => t('Select a type...'));
-  while ($dao->fetch()) {
-    $types[$dao->id] = $dao->name;
+  foreach ($financialTypes as $fType) {
+    $types[$fType['id']] =$fType['name'];
   }
 
   $form = array();
@@ -160,9 +168,6 @@ function commerce_civicrm_action_order_civicrm($order) {
     return;
   }
 
-  require_once 'CRM/Core/BAO/UFMatch.php';
-  require_once 'api/v2/Contact.php';
-
   // Find or create a CiviCRM contact ID for the customer.
   $cid = _commerce_civicrm_get_cid($order);
   if ($cid === FALSE) {
@@ -189,7 +194,6 @@ function commerce_civicrm_action_order_civicrm($order) {
  *   CRM_Contact_BAO_Group object describing the contact to add
  */
 function _commerce_civicrm_add_to_groups($cid) {
-  require_once 'api/v2/GroupContact.php';
 
   $groups = variable_get('commerce_civicrm_groups', '');
   if (empty($groups)) {
@@ -199,7 +203,7 @@ function _commerce_civicrm_add_to_groups($cid) {
   foreach ($groups as $id => $key) {
     if ($key != 0) {
       $params = array('contact_id' => $cid, 'group_id' => $key);
-      $result = civicrm_group_contact_add($params);
+      $result = civicrm_api3('GroupContact', 'create', $params);
       if (!empty($result['is_error'])) {
         watchdog('commerce_civicrm', 'Error adding contact to group: %error', array('%error' => $result['error_message']), WATCHDOG_ERROR);
       }
@@ -230,20 +234,25 @@ function _commerce_civicrm_get_cid($order) {
 
   // Anonymous user.
   // Look in the CiviCRM contacts table for a contact that matches the primary email.
-  $params = array('email' => $order->mail, 'return.contact_id' => TRUE);
-  $contact = civicrm_contact_search($params);
+  $params = array(
+    'sequential' => 1,
+    'email' => $order->mail,
+    'return' => 'id',
+    'options' => array('limit' => 1)
+  );
+  $contact = civicrm_api3('Contact', 'get', $params);
   if (!empty($contact['is_error'])) {
-    watchdog('commerce_civicrm', 'civicrm_contact_search(): %error', array('%error' => $contact['error_message']), WATCHDOG_ERROR);
+    watchdog('commerce_civicrm', '_commerce_civicrm_get_cid() : %error', array('%error' => $contact['error_message']), WATCHDOG_ERROR);
     return FALSE;
   }
+  $contact = $contact['values'];
 
   // No matches found, so we will need to create a contact.
   if (count($contact) == 0) {
     return 0;
   }
-  $cid = array_shift($contact);
 
-  return $cid;
+  return $contact[0]['id'];
 }
 
 
@@ -251,27 +260,20 @@ function _commerce_civicrm_get_cid($order) {
  *  Add or update contact information.
  */
 function _commerce_civicrm_add_update_contact($cid, $order) {
-  require_once 'api/v2/Location.php';
-
-  $contact = array();
 
   if ($cid != 0) {
     $params = array(
-      'contact_id' => $cid,
-      'return.contact_id'        => 1,
-      'return.contact_source'    => 1,
+      'sequential' => 1,
+      'id' => $cid,
+      'return' => 'id, source',
+      'options' => array('limit' => 1)
     );
-    $contact = civicrm_contact_search($params);
+    $contact = civicrm_api3('Contact', 'get', $params);
     if (!empty($contact['is_error'])) {
-      watchdog('commerce_civicrm', 'civicrm_contact_search(): %error', array('%error' => $contact['error_message']), WATCHDOG_ERROR);
+      watchdog('commerce_civicrm', '_commerce_civicrm_add_update_contact(): %error', array('%error' => $contact['error_message']), WATCHDOG_ERROR);
       return FALSE;
     }
-    $contact = array_shift($contact);
-    $contact['contact_id'] = $cid;
-    if (!empty($contact['contact_source'])) {
-      $contact['source']     = $contact['contact_source'];
-    }
-    unset($contact['contact_source']);
+    $contact = $contact['values'][0];
   }
 
   // Get customer profile information.
@@ -305,43 +307,32 @@ function _commerce_civicrm_add_update_contact($cid, $order) {
   }
 
   // Create contact or update existing contact.
-  $result = civicrm_contact_add($contact);
+  $result = civicrm_api3('Contact', 'create', $contact);
   if (!empty($result['is_error'])) {
-    watchdog('commerce_civicrm', 'civicrm_contact_add(): %error', array('%error' => $rc['error_message']), WATCHDOG_ERROR);
+    watchdog('commerce_civicrm', '_commerce_civicrm_add_update_contact(): %error', array('%error' => $result['error_message']), WATCHDOG_ERROR);
     return FALSE;
   }
 
   // Billing location.
-  $address = array(
-    1 => array(
-      'location_type'          => 'Billing',
-      'is_primary'             => TRUE,
-      'city'                   => $billing_address['locality'],
-      'state_province'         => $billing_address['administrative_area'],
-      'postal_code'            => $billing_address['postal_code'],
-      'street_address'         => $billing_address['thoroughfare'],
-      'supplemental_address_1' => $billing_address['premise'],
-      'country'                => $billing_address['country'],
-    )
+  $params = array(
+    'contact_id'             => $cid,
+    'location_type_id'       => 'Billing',
+    'is_primary'             => TRUE,
+    'city'                   => $billing_address['locality'],
+    'postal_code'            => $billing_address['postal_code'],
+    'street_address'         => $billing_address['thoroughfare'],
+    'supplemental_address_1' => $billing_address['premise'],
   );
 
-  // Phone - TODO: where to get this information?
-  //$phone = array();
-  //$phone = array(
-  //  'phone' => $phone_number,
-  //  'is_primary' => TRUE,
-  //  'phone_type_id' => 1,
-  //  'location_type' => 'Home',
-  //);
-  //$phones = array($phone);
-
-  // Add / update the location.
-  //$params = array('version' => '3.0', 'contact_id' => $cid, 'phone' => $phones, 'address' => $address);
-  $params = array('version' => '3.0', 'contact_id' => $cid, 'address' => $address);
-  $new_location = civicrm_location_update($params);
-  if ($new_location['is_error'] && strpos($new_location['error_message'], "Invalid Location Type(s)") !== FALSE) {
-    $new_location = civicrm_location_add($params);
+  if ( ($provinceID = checkProvince($billing_address['administrative_area'])) !== false )  {
+    $params = array_merge($params, array( 'state_province_id'=> $provinceID));
   }
+
+  if ( ($countryID = checkCountry($billing_address['country'])) !== false )  {
+    $params = array_merge($params, array( 'country_id'=> $countryID));
+  }
+
+  $new_location = civicrm_api3('Address', 'create', $params);
 
   // Check if we have shipping information.
   if (!empty($order_wrapper->commerce_customer_shipping)) {
@@ -350,30 +341,30 @@ function _commerce_civicrm_add_update_contact($cid, $order) {
     $shipping_address = $shipping_profile_wrapper->commerce_customer_address->value();
 
     // Shipping location.
-    $address = array(
-      1 => array(
-        'location_type'          => 'Home',
-        'is_primary'             => TRUE,
-        'city'                   => $shipping_address['locality'],
-        'state_province'         => $shipping_address['administrative_area'],
-        'postal_code'            => $shipping_address['postal_code'],
-        'street_address'         => $shipping_address['thoroughfare'],
-        'supplemental_address_1' => $shipping_address['premise'],
-        'country'                => $shipping_address['country'],
-      )
+    $params = array(
+      'contact_id'             => $cid,
+      'location_type_id'       => 'Home',
+      'is_primary'             => TRUE,
+      'city'                   => $shipping_address['locality'],
+      'postal_code'            => $shipping_address['postal_code'],
+      'street_address'         => $shipping_address['thoroughfare'],
+      'supplemental_address_1' => $shipping_address['premise'],
     );
 
-    // Add / update the location.
-    $params = array('version' => '3.0', 'contact_id' => $cid, 'address' => $address);
-    $new_location = civicrm_location_update($params);
-    if ($new_location['is_error'] && strpos($new_location['error_message'], "Invalid Location Type(s): Shipping") !== FALSE) {
-      $new_location = civicrm_location_add($params);
+    if ( ($provinceID = checkProvince($billing_address['administrative_area'])) !== false )  {
+      $params = array_merge($params, array( 'state_province_id'=> $provinceID));
     }
+
+    if ( ($countryID = checkCountry($billing_address['country'])) !== false )  {
+      $params = array_merge($params, array( 'country_id'=> $countryID));
+    }
+    // Add / update the location.
+    $new_location = civicrm_api3('Address', 'create', $params);
   }
 
   // Log the error, but continue.
   if (civicrm_error($new_location)) {
-    watchdog('commerce_civicrm', 'civicrm_location_update(): %error', array('%error' => $new_location['error_message']), WATCHDOG_ERROR);
+    watchdog('commerce_civicrm', '_commerce_civicrm_add_update_contact(): %error', array('%error' => $new_location['error_message']), WATCHDOG_ERROR);
   }
 
   return $cid;
@@ -389,20 +380,17 @@ function _commerce_civicrm_create_custom_contribution_fields() {
     return;
   }
 
-  require_once 'CRM/Core/Config.php';
-  require_once 'api/v2/CustomGroup.php';
-
   // First we need to check if the Sales Tax and Shipping custom fields have
   // already been created.
   $params = array(
     'title'            => 'Drupal Commerce Purchases',
     'name'             => 'commerce_purchases',
-    'extends'          => array('Contribution'),
+    'extends'          => 'Contribution',
     'weight'           => 1,
     'collapse_display' => 0,
     'is_active'        => 1,
   );
-  $custom_group = civicrm_custom_group_create($params);
+  $custom_group = civicrm_api3('CustomGroup', 'create', $params);
   variable_set('commerce_civicrm_contribution_group_id', $custom_group['id']);
 
   $params = array(
@@ -415,8 +403,8 @@ function _commerce_civicrm_create_custom_contribution_fields() {
     'is_searchable'   => 0,
     'is_active'       => 1,
   );
-  $tax_field = civicrm_custom_field_create($params);
-  variable_set('commerce_civicrm_tax_field_id', $tax_field['result']['customFieldId']);
+  $tax_field = civicrm_api3('CustomField', 'create', $params);
+  variable_set('commerce_civicrm_tax_field_id', $tax_field['id']);
 
   $params = array(
     'custom_group_id' => $custom_group['id'],
@@ -428,8 +416,8 @@ function _commerce_civicrm_create_custom_contribution_fields() {
     'is_searchable'   => 0,
     'is_active'       => 1,
   );
-  $shipping_field = civicrm_custom_field_create($params);
-  variable_set('commerce_civicrm_shipping_field_id', $shipping_field['result']['customFieldId']);
+  $shipping_field = civicrm_api3('CustomField', 'create', $params);
+  variable_set('commerce_civicrm_shipping_field_id', $shipping_field['id']);
 }
 
 
@@ -448,7 +436,7 @@ function _commerce_civicrm_add_contribution($cid, &$order) {
   $transactions = commerce_payment_transaction_load_multiple(array(), array('order_id' => $order->order_id));
   $transaction = array_pop($transactions);
   if (empty($transaction)) {
-    $txn_id = time() . '_' . rand(1000, 9999); 
+    $txn_id = time() . '_' . rand(1000, 9999);
   }
   else {
     $txn_id = $transaction->transaction_id;
@@ -482,7 +470,7 @@ function _commerce_civicrm_add_contribution($cid, &$order) {
     'contact_id' => $cid,
     'receive_date' => date('Ymd'),
     'total_amount' => $order_total,
-    'contribution_type_id' => variable_get('commerce_civicrm_contribution_type', ''), // @FIXME this needs a sensible default
+    'financial_type_id' => variable_get('commerce_civicrm_contribution_type', ''), // @FIXME this needs a sensible default
     'payment_instrument_id' => $payment_instrument_id,
     'non_deductible_amount' => 00.00,
     'fee_amount' => 00.00,
@@ -500,12 +488,11 @@ function _commerce_civicrm_add_contribution($cid, &$order) {
     $params['custom_' . $shipping_field_id] = $shipping_total;
   }
 
-  require_once 'api/v2/Contribute.php';
-  $contribution = civicrm_contribution_add($params);
+  $contribution = civicrm_api3('Contribution', 'create', $params);
 
   // Log the error, but continue.
   if (civicrm_error($contribution)) {
-    watchdog('commerce_civicrm', 'civicrm_contribution_add(): %error', array('%error' => $contribution['error_message']), WATCHDOG_ERROR);
+    watchdog('commerce_civicrm', '_commerce_civicrm_add_contribution(): %error', array('%error' => $contribution['error_message']), WATCHDOG_ERROR);
   }
 
   return TRUE;
@@ -599,7 +586,7 @@ function _commerce_civicrm_create_detail_string($order_wrapper) {
         $titles[$title] += $quantity;
       }
     }
-    
+
   }
 
   // Display the product titles and the number purchased.
@@ -632,7 +619,7 @@ function _commerce_civicrm_display_customer_orders($customer) {
   $orders = commerce_order_load_multiple($order_ids);
 
   $header = array(t('Order ID'), t('Date'), t('Billing name'),
-                  t('Shipping name'), t('Items'), t('Total'), t('Operations'));
+    t('Shipping name'), t('Items'), t('Total'), t('Operations'));
   $rows = array();
   $totals = array('orders' => 0, 'items' => 0, 'total' => 0);
   foreach ($orders as $order) {
@@ -688,10 +675,10 @@ function _commerce_civicrm_display_customer_orders($customer) {
 
   $build['description'] = array(
     '#markup' => '<p>' . t('!totals_orders orders shown match that account with !totals_items items purchased and !totals_total spent:', array(
-      '!totals_orders' => $totals['orders'],
-      '!totals_items' => $totals['items'],
-      '!totals_total' => commerce_currency_format($totals['total'], $currency),
-    )) . '</p>',
+        '!totals_orders' => $totals['orders'],
+        '!totals_items' => $totals['items'],
+        '!totals_total' => commerce_currency_format($totals['total'], $currency),
+      )) . '</p>',
     '#weight' => -5,
   );
   $build['orders'] = array(
@@ -709,3 +696,29 @@ function _commerce_civicrm_display_customer_orders($customer) {
   return $build;
 }
 
+function checkCountry($country)  {
+  if (!empty($country))  {
+    $allCountries = CRM_Core_PseudoConstant::countryIsoCode();
+    $result = civicrm_api3('Setting', 'get', array(
+      'sequential' => 1,
+      'return' => "countryLimit",
+    ));
+    $countryLimit = $result['values'][0]['countryLimit'];
+    $checkCountry = array_search($country, $allCountries);
+    if ($checkCountry !== false && in_array($checkCountry, $countryLimit))  {
+      return $checkCountry;
+    }
+  }
+  return false;
+}
+
+function checkProvince($province)  {
+  if (!empty($province))  {
+    $allProvinces = CRM_Core_PseudoConstant::stateProvinceAbbreviation();
+    $checkProvince = array_search($province, $allProvinces);
+    if ($checkProvince !== false)  {
+      return $checkProvince;
+    }
+  }
+  return false;
+}
