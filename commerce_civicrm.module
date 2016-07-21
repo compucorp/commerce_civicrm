@@ -313,6 +313,10 @@ function _commerce_civicrm_add_update_contact($cid, $order) {
     return FALSE;
   }
 
+  if ($cid == 0)  {
+    $cid = $result['id'];
+  }
+
   // Billing location.
   $params = array(
     'contact_id'             => $cid,
