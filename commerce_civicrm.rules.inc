@@ -19,6 +19,15 @@ function commerce_civicrm_rules_action_info() {
     ),
   );
 
+  $actions['commerce_civicrm_update_order_civicrm'] = array(
+    'group' => t('Commerce CiviCRM'),
+    'label' => t('Update civicrm contribution on order update'),
+    'base' => 'commerce_civicrm_action_order_civicrm_update',
+    'parameter' => array(
+      'commerce_order' => array('type' => 'commerce_order', 'label' => t('Order')),
+    ),
+  );
+
   return $actions;
 }
 

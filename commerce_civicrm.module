@@ -546,10 +546,13 @@ function _commerce_civicrm_map_contribution_status($order_status) {
     'completed'         => 1,
     'payment_received'  => 1,
     'pending'           => 2,
+    'processing'        => 2,
     'canceled'          => 3,
     'cart'              => 5,
     'checkout_checkout' => 5,
     'checkout_review'   => 5,
+    'checkout_payment'  => 5,
+    'checkout_complete' => 5,
   );
 
   if (array_key_exists($order_status, $map)) {
@@ -725,4 +728,64 @@ function checkProvince($province)  {
     }
   }
   return false;
+}
+
+/**
+ * update the contribution on civicrm side in case the corresponding
+ * order get updated
+ *
+ * @param $order
+ */
+function commerce_civicrm_action_order_civicrm_update($order)  {
+  // initialize civicrm
+  if (!civicrm_initialize()) {
+    return;
+  }
+
+  // get the corresponding contribution ID to the order that get updated
+  $contributionEntity = civicrm_api3('Contribution', 'get', array(
+    'sequential' => 1,
+    'return' => "id",
+    'invoice_id' => $order->order_id . "_dc",
+  ));
+
+  if (!empty($contributionEntity['id']))  {
+    // update contact data
+    $cid = _commerce_civicrm_get_cid($order);
+    if ($cid !== FALSE) {
+      _commerce_civicrm_add_update_contact($cid, $order);
+    }
+
+    // get the total amount after updaing the order
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+    $total = $order_wrapper->commerce_order_total->amount->value();
+    $order_total = $total / 100;
+
+    $notes =  _commerce_civicrm_create_detail_string($order_wrapper);
+
+    $contributionID = $contributionEntity['id'];
+
+    // update the contribution data
+    try  {
+
+    }
+    catch(CiviCRM_API3_Exception $e)  {
+
+    }
+    $contribution = civicrm_api3('Contribution', 'create', array(
+      'sequential' => 1,
+      'id' => $contributionID,
+      'total_amount' => $order_total,
+      'net_amount' => $order_total,
+      'source' => $notes,
+      'contribution_status_id' => _commerce_civicrm_map_contribution_status($order->status),
+      'notes' => $notes,
+    ));
+
+    // Log the error
+    if (civicrm_error($contribution)) {
+      watchdog('commerce_civicrm', 'commerce_civicrm_action_order_civicrm_update(): %error', array('%error' => $contribution['error_message']), WATCHDOG_ERROR);
+    }
+  }
+
 }
