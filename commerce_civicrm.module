@@ -629,6 +629,7 @@ function _commerce_civicrm_display_customer_orders($customer) {
     t('Shipping name'), t('Items'), t('Total'), t('Operations'));
   $rows = array();
   $totals = array('orders' => 0, 'items' => 0, 'total' => 0);
+  $currency = '';
   foreach ($orders as $order) {
     $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
 
@@ -765,13 +766,6 @@ function commerce_civicrm_action_order_civicrm_update($order)  {
 
     $contributionID = $contributionEntity['id'];
 
-    // update the contribution data
-    try  {
-
-    }
-    catch(CiviCRM_API3_Exception $e)  {
-
-    }
     $contribution = civicrm_api3('Contribution', 'create', array(
       'sequential' => 1,
       'id' => $contributionID,
@@ -785,6 +779,42 @@ function commerce_civicrm_action_order_civicrm_update($order)  {
     // Log the error
     if (civicrm_error($contribution)) {
       watchdog('commerce_civicrm', 'commerce_civicrm_action_order_civicrm_update(): %error', array('%error' => $contribution['error_message']), WATCHDOG_ERROR);
+    }
+  }
+
+}
+
+/**
+ * cancel the contribution on civicrm side in case the corresponding
+ * order get deleted
+ *
+ * @param $order
+ */
+function commerce_civicrm_action_order_civicrm_delete($order)
+{
+  // initialize civicrm
+  if (!civicrm_initialize()) {
+    return;
+  }
+
+  // get the corresponding contribution ID to the order that get updated
+  $contributionEntity = civicrm_api3('Contribution', 'get', array(
+    'sequential' => 1,
+    'return' => "id",
+    'invoice_id' => $order->order_id . "_dc",
+  ));
+
+  if (!empty($contributionEntity['id']))  {
+    $contributionID = $contributionEntity['id'];
+
+    $contribution = civicrm_api3('Contribution', 'create', array(
+      'id' => $contributionID,
+      'contribution_status_id' => _commerce_civicrm_map_contribution_status('canceled'),
+    ));
+
+    // Log the error
+    if (civicrm_error($contribution)) {
+      watchdog('commerce_civicrm', 'commerce_civicrm_action_order_civicrm_delete(): %error', array('%error' => $contribution['error_message']), WATCHDOG_ERROR);
     }
   }
 

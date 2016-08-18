@@ -24,6 +24,14 @@ function commerce_civicrm_default_rules_configuration() {
   $rule->action('commerce_civicrm_update_order_civicrm', array('commerce_order:select' => 'commerce-order'));
   $configs['commerce_civicrm_update_order'] = $rule;
 
+  // configuration to cancel civicrm contribution when deleting the corresponding order
+  $rule = rules_reaction_rule();
+  $rule->label = t('Cancel CiviCRM contribution when deleting the corresponding order');
+  $rule->active = TRUE;
+  $rule->event('commerce_order_delete');
+  $rule->action('commerce_civicrm_delete_order_civicrm', array('commerce_order:select' => 'commerce-order'));
+  $configs['commerce_civicrm_delete_order'] = $rule;
+
 
   return $configs;
 }

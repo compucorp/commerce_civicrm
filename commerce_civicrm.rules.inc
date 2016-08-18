@@ -28,6 +28,15 @@ function commerce_civicrm_rules_action_info() {
     ),
   );
 
+  $actions['commerce_civicrm_delete_order_civicrm'] = array(
+    'group' => t('Commerce CiviCRM'),
+    'label' => t('Cancel CiviCRM contribution when deleting the corresponding order'),
+    'base' => 'commerce_civicrm_action_order_civicrm_delete',
+    'parameter' => array(
+      'commerce_order' => array('type' => 'commerce_order', 'label' => t('Order')),
+    ),
+  );
+
   return $actions;
 }
 
