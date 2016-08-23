@@ -10,12 +10,57 @@
  * Implements hook_rules_action_info().
  */
 function commerce_civicrm_rules_action_info() {
-  $actions['commerce_civicrm_create_order_civicrm'] = array(
+  $actions['commerce_civicrm_action_checkout_complete'] = array(
     'group' => t('Commerce CiviCRM'),
-    'label' => t('Add and update CiviCRM contact record'),
-    'base' => 'commerce_civicrm_action_order_civicrm',
+    'label' => t('Action when checkout is complete'),
+    'base' => 'commerce_civicrm_action_checkout_complete',
     'parameter' => array(
       'commerce_order' => array('type' => 'commerce_order', 'label' => t('Order')),
+    ),
+  );
+
+  $actions['commerce_civicrm_action_order_update'] = array(
+    'group' => t('Commerce CiviCRM'),
+    'label' => t('Action when updating an order'),
+    'base' => 'commerce_civicrm_action_order_update',
+    'parameter' => array(
+      'commerce_order' => array('type' => 'commerce_order', 'label' => t('Order')),
+    ),
+  );
+
+  $actions['commerce_civicrm_action_order_delete'] = array(
+    'group' => t('Commerce CiviCRM'),
+    'label' => t('Action when deleting an order'),
+    'base' => 'commerce_civicrm_action_order_delete',
+    'parameter' => array(
+      'commerce_order' => array('type' => 'commerce_order', 'label' => t('Order')),
+    ),
+  );
+
+  $actions['commerce_civicrm_action_product_insert'] = array(
+    'group' => t('Commerce CiviCRM'),
+    'label' => t('Action when creating a new product'),
+    'base' => 'commerce_civicrm_action_product_insert',
+    'parameter' => array(
+      'commerce_product' => array('type' => 'commerce_product', 'label' => t('Product')),
+    ),
+  );
+
+  $actions['commerce_civicrm_action_product_update'] = array(
+    'group' => t('Commerce CiviCRM'),
+    'label' => t('Action when updating a product'),
+    'base' => 'commerce_civicrm_action_product_update',
+    'parameter' => array(
+      'commerce_product' => array('type' => 'commerce_product', 'label' => t('Product')),
+    ),
+  );
+
+  $actions['commerce_civicrm_action_product_delete'] = array(
+    'group' => t('Commerce CiviCRM'),
+    'label' => t('Action when deleting a product'),
+    'base' => 'commerce_civicrm_action_product_delete',
+    'parameter' => array(
+      'commerce_product' => array('type' => 'commerce_product', 'label' => t('Product')),
     ),
   );
 

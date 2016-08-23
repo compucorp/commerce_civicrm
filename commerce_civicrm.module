@@ -127,6 +127,7 @@ function commerce_civicrm_admin() {
   $financialTypes = civicrm_api3('FinancialType', 'get', array(
     'sequential' => 1,
     'is_active' => 1,
+    'options' => array('limit' => 0),
   ));
   $financialTypes = $financialTypes['values'];
   $types = array(0 => t('Select a type...'));
@@ -134,13 +135,33 @@ function commerce_civicrm_admin() {
     $types[$fType['id']] =$fType['name'];
   }
 
+  // Get Price Sets.
+  $PriceSetEntity = civicrm_api3('PriceSet', 'get', array(
+    'sequential' => 1,
+    'is_active' => 1,
+    'options' => array('limit' => 0),
+  ));
+  $PriceSetEntity = $PriceSetEntity['values'];
+  $priceSets = array(0 => t('Select a set...'));
+  foreach ($PriceSetEntity as $pSet) {
+    $priceSets[$pSet['id']] =$pSet['title'];
+  }
+
   $form = array();
   $form['commerce_civicrm_contribution_type'] = array(
     '#type' => 'select',
-    '#title' => t('Contribution type'),
+    '#title' =>  t('Contribution type') . ' <span class="form-required" title="This field is required.">*</span>',
     '#default_value' => variable_get('commerce_civicrm_contribution_type', array()),
     '#options' => $types,
     '#description' => t('Select a contribution type for purchases, making a new type with a name like "Drupal purchase" is recommended.'),
+  );
+
+  $form['commerce_civicrm_price_set'] = array(
+    '#type' => 'select',
+    '#title' => t('Price Set') . ' <span class="form-required" title="This field is required.">*</span>',
+    '#default_value' => variable_get('commerce_civicrm_price_set'),
+    '#options' => $priceSets,
+    '#description' => t('Select a Price Set for purchases, making a new set with a name like "Drupal purchase Set" is recommended.'),
   );
 
   $form['commerce_civicrm_groups'] = array(
@@ -155,14 +176,11 @@ function commerce_civicrm_admin() {
 
 
 /**
- * Called when the an order is created or changed. Creates a new order or
- * updates an existing one.
+ * Called when the user checkout an order
  *
  * @param $order
- *   the order
  */
-function commerce_civicrm_action_order_civicrm($order) {
-  global $user;
+function commerce_civicrm_action_checkout_complete($order) {
 
   if (!civicrm_initialize()) {
     return;
@@ -185,32 +203,6 @@ function commerce_civicrm_action_order_civicrm($order) {
   // Add this contact to selected groups.
   _commerce_civicrm_add_to_groups($cid);
 }
-
-
-/**
- * Add contact to any specified groups.
- *
- * @param $cid
- *   CRM_Contact_BAO_Group object describing the contact to add
- */
-function _commerce_civicrm_add_to_groups($cid) {
-
-  $groups = variable_get('commerce_civicrm_groups', '');
-  if (empty($groups)) {
-    return;
-  }
-
-  foreach ($groups as $id => $key) {
-    if ($key != 0) {
-      $params = array('contact_id' => $cid, 'group_id' => $key);
-      $result = civicrm_api3('GroupContact', 'create', $params);
-      if (!empty($result['is_error'])) {
-        watchdog('commerce_civicrm', 'Error adding contact to group: %error', array('%error' => $result['error_message']), WATCHDOG_ERROR);
-      }
-    }
-  }
-}
-
 
 /**
  * Get contact id for the customer.
@@ -254,7 +246,6 @@ function _commerce_civicrm_get_cid($order) {
 
   return $contact[0]['id'];
 }
-
 
 /**
  *  Add or update contact information.
@@ -374,6 +365,189 @@ function _commerce_civicrm_add_update_contact($cid, $order) {
   return $cid;
 }
 
+/**
+ * Add a contribution record.
+ *
+ * Create any custom fields and get the transaction id. If it doesn't exist,
+ * make one up and add the contribution.
+ */
+function _commerce_civicrm_add_contribution($cid, &$order) {
+  _commerce_civicrm_create_custom_contribution_fields();
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // TODO: how to handle multiple transactions on one order?
+  $transactions = commerce_payment_transaction_load_multiple(array(), array('order_id' => $order->order_id));
+  $transaction = array_pop($transactions);
+  if (empty($transaction)) {
+    $txn_id = time() . '_' . rand(1000, 9999);
+  }
+  else {
+    $txn_id = $transaction->transaction_id;
+  }
+
+  $total = $order_wrapper->commerce_order_total->amount->value();
+  $order_total = $total / 100;
+
+  $tax_field_id = variable_get('commerce_civicrm_tax_field_id', '');
+  $shipping_field_id = variable_get('commerce_civicrm_shipping_field_id', '');
+  $tax_total = 0;
+  $shipping_total = 0;
+
+  // Get the tax total.
+  if (module_exists('commerce_tax')) {
+    $components = $order_wrapper->commerce_order_total->data->value();
+    $tax_total = commerce_tax_total_amount($components['components'], TRUE, commerce_default_currency()) / 100;
+  }
+
+  // TODO: figure out where to get the shipping total from.
+
+  if (!empty($order_wrapper->data)) {
+    $payment_instrument_id = _commerce_civicrm_map_payment_instrument($order_wrapper->data['payment_method']);
+  }
+  else {
+    $payment_instrument_id = _commerce_civicrm_map_payment_instrument('credit');
+  }
+
+  $notes = _commerce_civicrm_create_detail_string($order_wrapper);
+
+
+  $products = array();
+  $financial_type_id = variable_get('commerce_civicrm_contribution_type');
+
+  // get line items and quantities
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+      // Extract a product ID and quantity from the line item.
+      $line_item_sku = $line_item_wrapper->commerce_product->sku->value();
+      $quantity = $line_item_wrapper->quantity->value();
+      $unit_price = ($line_item_wrapper->commerce_unit_price->amount->value())/100;
+      $title = $line_item_wrapper->commerce_product->title->value();
+
+      $priceFieldID = civicrm_api3('PriceField', 'get', array(
+        'sequential' => 1,
+        'name' => $line_item_sku,
+      ));
+      $priceFieldID = $priceFieldID['id'];
+
+      $priceFieldValueID = civicrm_api3('PriceFieldValue', 'get', array(
+        'sequential' => 1,
+        "price_field_id" => $priceFieldID,
+      ));
+      $priceFieldValueID = $priceFieldValueID['id'];
+
+      $taxRate = 0;
+      $taxRates = CRM_Core_PseudoConstant::getTaxRates();
+      if (array_key_exists($financial_type_id, $taxRates)) {
+        $taxRate = $taxRates[$financial_type_id];
+      }
+
+      // Update the product's quantity value.
+      if (empty($products[$priceFieldID])) {
+        $products[$priceFieldID] = array(
+          'title' => $title,
+          'quantity' => $quantity,
+          'unit_price' => $unit_price,
+          'price_field_value_id' => $priceFieldValueID,
+          'tax_rate' => $taxRate,
+        );
+      }
+      else {
+        $quantity = $products[$priceFieldID] + $quantity;
+        $products[$priceFieldID] = array(
+          'title' => $title,
+          'quantity' => $quantity,
+          'unit_price' => $unit_price,
+          'price_field_value_id' => $priceFieldValueID,
+          'tax_rate' => $taxRate,
+        );
+      }
+    }
+  }
+
+  // build line items API array
+  $taxAmountTotal = 0;
+  $lineItemsParams = array();
+  $i = 0;
+  foreach($products as $priceFieldID => $values) {
+    $lineTotal = $values['unit_price'] * $values['quantity'];
+    $taxAmount = CRM_Contribute_BAO_Contribution_Utils::calculateTaxAmount($lineTotal, $values['tax_rate']);
+    $taxAmount = $taxAmount['tax_amount'];
+
+    $lineItemsParams[$i] = array(
+      'label' => $values['title'],
+      'price_field_id' => $priceFieldID,
+      'qty' => $values['quantity'],
+      'unit_price' => $values['unit_price'],
+      'line_total' => $values['unit_price'] * $values['quantity'],
+      'financial_type_id' =>  variable_get('commerce_civicrm_contribution_type'),
+      'price_field_value_id' => $values['price_field_value_id'],
+      'tax_amount' => $taxAmount,
+    );
+
+    $i++;
+    $taxAmountTotal += $taxAmount;
+  }
+
+
+  $params = array(
+    'contact_id' => $cid,
+    'receive_date' => date('Ymd'),
+    'total_amount' => $order_total,
+    'financial_type_id' => $financial_type_id, // @FIXME this needs a sensible default
+    'payment_instrument_id' => $payment_instrument_id,
+    'non_deductible_amount' => 00.00,
+    'fee_amount' => 00.00,
+    'net_amount' => $order_total + $taxAmountTotal,
+    'tax_amount' => $taxAmountTotal,
+    'trxn_id' => $txn_id,
+    'invoice_id' => $order->order_id . '_dc',
+    'source' => $notes,
+    'contribution_status_id' => _commerce_civicrm_map_contribution_status($order->status),
+    'skipLineItem' => 1,
+    'api.line_item.create' => $lineItemsParams,
+  );
+  if (!empty($tax_field_id)) {
+    $params['custom_' . $tax_field_id] = $tax_total;
+  }
+  if (!empty($shipping_field_id)) {
+    $params['custom_' . $shipping_field_id] = $shipping_total;
+  }
+
+  $contribution = civicrm_api3('Contribution', 'create', $params);
+
+  // Log the error, but continue.
+  if (civicrm_error($contribution)) {
+    watchdog('commerce_civicrm', '_commerce_civicrm_add_contribution(): %error', array('%error' => $contribution['error_message']), WATCHDOG_ERROR);
+  }
+
+  return TRUE;
+}
+
+/**
+ * Add contact to any specified groups.
+ *
+ * @param $cid
+ *   CRM_Contact_BAO_Group object describing the contact to add
+ */
+function _commerce_civicrm_add_to_groups($cid) {
+
+  $groups = variable_get('commerce_civicrm_groups', '');
+  if (empty($groups)) {
+    return;
+  }
+
+  foreach ($groups as $id => $key) {
+    if ($key != 0) {
+      $params = array('contact_id' => $cid, 'group_id' => $key);
+      $result = civicrm_api3('GroupContact', 'create', $params);
+      if (!empty($result['is_error'])) {
+        watchdog('commerce_civicrm', 'Error adding contact to group: %error', array('%error' => $result['error_message']), WATCHDOG_ERROR);
+      }
+    }
+  }
+}
+
 
 /**
  * Creates required contribution fields if they have not already been created.
@@ -424,85 +598,6 @@ function _commerce_civicrm_create_custom_contribution_fields() {
   variable_set('commerce_civicrm_shipping_field_id', $shipping_field['id']);
 }
 
-
-/**
- * Add a contribution record.
- *
- * Create any custom fields and get the transaction id. If it doesn't exist,
- * make one up and add the contribution.
- */
-function _commerce_civicrm_add_contribution($cid, &$order) {
-  _commerce_civicrm_create_custom_contribution_fields();
-
-  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
-
-  // TODO: how to handle multiple transactions on one order?
-  $transactions = commerce_payment_transaction_load_multiple(array(), array('order_id' => $order->order_id));
-  $transaction = array_pop($transactions);
-  if (empty($transaction)) {
-    $txn_id = time() . '_' . rand(1000, 9999);
-  }
-  else {
-    $txn_id = $transaction->transaction_id;
-  }
-
-  $total = $order_wrapper->commerce_order_total->amount->value();
-  $order_total = $total / 100;
-
-  $tax_field_id = variable_get('commerce_civicrm_tax_field_id', '');
-  $shipping_field_id = variable_get('commerce_civicrm_shipping_field_id', '');
-  $tax_total = 0;
-  $shipping_total = 0;
-
-  // Get the tax total.
-  if (module_exists('commerce_tax')) {
-    $components = $order_wrapper->commerce_order_total->data->value();
-    $tax_total = commerce_tax_total_amount($components['components'], TRUE, commerce_default_currency()) / 100;
-  }
-
-  // TODO: figure out where to get the shipping total from.
-
-  if (!empty($order_wrapper->data)) {
-    $payment_instrument_id = _commerce_civicrm_map_payment_instrument($order_wrapper->data['payment_method']);
-  }
-  else {
-    $payment_instrument_id = _commerce_civicrm_map_payment_instrument('credit');
-  }
-
-  $notes = _commerce_civicrm_create_detail_string($order_wrapper);
-  $params = array(
-    'contact_id' => $cid,
-    'receive_date' => date('Ymd'),
-    'total_amount' => $order_total,
-    'financial_type_id' => variable_get('commerce_civicrm_contribution_type', ''), // @FIXME this needs a sensible default
-    'payment_instrument_id' => $payment_instrument_id,
-    'non_deductible_amount' => 00.00,
-    'fee_amount' => 00.00,
-    'net_amount' => $order_total,
-    'trxn_id' => $txn_id,
-    'invoice_id' => $order->order_id . '_dc',
-    'source' => $notes,
-    'contribution_status_id' => _commerce_civicrm_map_contribution_status($order->status),
-    'note' => $notes,
-  );
-  if (!empty($tax_field_id)) {
-    $params['custom_' . $tax_field_id] = $tax_total;
-  }
-  if (!empty($shipping_field_id)) {
-    $params['custom_' . $shipping_field_id] = $shipping_total;
-  }
-
-  $contribution = civicrm_api3('Contribution', 'create', $params);
-
-  // Log the error, but continue.
-  if (civicrm_error($contribution)) {
-    watchdog('commerce_civicrm', '_commerce_civicrm_add_contribution(): %error', array('%error' => $contribution['error_message']), WATCHDOG_ERROR);
-  }
-
-  return TRUE;
-}
-
-
 /**
  * Maps a Drupal Commerce payment method to a CiviCRM payment instrument.
  *
@@ -546,10 +641,13 @@ function _commerce_civicrm_map_contribution_status($order_status) {
     'completed'         => 1,
     'payment_received'  => 1,
     'pending'           => 2,
+    'processing'        => 2,
     'canceled'          => 3,
     'cart'              => 5,
     'checkout_checkout' => 5,
     'checkout_review'   => 5,
+    'checkout_payment'  => 5,
+    'checkout_complete' => 5,
   );
 
   if (array_key_exists($order_status, $map)) {
@@ -605,7 +703,7 @@ function _commerce_civicrm_create_detail_string($order_wrapper) {
   return $str;
 }
 
-// TODO
+
 /**
  * Displays a list of orders made by a customer.
  *
@@ -626,6 +724,7 @@ function _commerce_civicrm_display_customer_orders($customer) {
     t('Shipping name'), t('Items'), t('Total'), t('Operations'));
   $rows = array();
   $totals = array('orders' => 0, 'items' => 0, 'total' => 0);
+  $currency = '';
   foreach ($orders as $order) {
     $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
 
@@ -725,4 +824,356 @@ function checkProvince($province)  {
     }
   }
   return false;
+}
+
+/**
+ * Called when the user update an existing order
+ *
+ * @param $order
+ */
+function commerce_civicrm_action_order_update($order)  {
+  // initialize civicrm
+  if (!civicrm_initialize()) {
+    return;
+  }
+
+  _commerce_civicrm_update_contribution($order);
+}
+
+/**
+ * Update existing contribution and related line items
+ * when the related order get updated
+ *
+ * @param $order
+ */
+function _commerce_civicrm_update_contribution($order) {
+  // get the corresponding contribution ID to the order that get updated
+  $contributionEntity = civicrm_api3('Contribution', 'get', array(
+    'sequential' => 1,
+    'return' => "id",
+    'invoice_id' => $order->order_id . "_dc",
+  ));
+
+  if (empty($contributionEntity['id']))  {
+    return;
+  }
+
+  $contributionID = $contributionEntity['id'];
+  // update contact data
+  $cid = _commerce_civicrm_get_cid($order);
+  if ($cid !== FALSE) {
+    _commerce_civicrm_add_update_contact($cid, $order);
+  }
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // get the total amount after updaing the order
+  $total = $order_wrapper->commerce_order_total->amount->value();
+  $order_total = $total / 100;
+
+  $tax_field_id = variable_get('commerce_civicrm_tax_field_id', '');
+  $shipping_field_id = variable_get('commerce_civicrm_shipping_field_id', '');
+  $tax_total = 0;
+  $shipping_total = 0;
+
+  // Get the tax total.
+  if (module_exists('commerce_tax')) {
+    $components = $order_wrapper->commerce_order_total->data->value();
+    $tax_total = commerce_tax_total_amount($components['components'], TRUE, commerce_default_currency()) / 100;
+  }
+
+  $notes =  _commerce_civicrm_create_detail_string($order_wrapper);
+
+  $products = array();
+  $financial_type_id = variable_get('commerce_civicrm_contribution_type');
+
+  // get line items and quantities
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+      // Extract a product ID and quantity from the line item.
+      $line_item_sku = $line_item_wrapper->commerce_product->sku->value();
+      $quantity = $line_item_wrapper->quantity->value();
+      $unit_price = ($line_item_wrapper->commerce_unit_price->amount->value())/100;
+      $title = $line_item_wrapper->commerce_product->title->value();
+
+      $priceFieldID = civicrm_api3('PriceField', 'get', array(
+        'sequential' => 1,
+        'name' => $line_item_sku,
+      ));
+      $priceFieldID = $priceFieldID['id'];
+
+      $priceFieldValueID = civicrm_api3('PriceFieldValue', 'get', array(
+        'sequential' => 1,
+        "price_field_id" => $priceFieldID,
+      ));
+      $priceFieldValueID = $priceFieldValueID['id'];
+
+      $taxRate = 0;
+      $taxRates = CRM_Core_PseudoConstant::getTaxRates();
+      if (array_key_exists($financial_type_id, $taxRates)) {
+        $taxRate = $taxRates[$financial_type_id];
+      }
+
+      // Update the product's quantity value.
+      if (empty($products[$priceFieldID])) {
+        $products[$priceFieldID] = array(
+          'title' => $title,
+          'quantity' => $quantity,
+          'unit_price' => $unit_price,
+          'price_field_value_id' => $priceFieldValueID,
+          'tax_rate' => $taxRate,
+        );
+      }
+      else {
+        $quantity = $products[$priceFieldID] + $quantity;
+        $products[$priceFieldID] = array(
+          'title' => $title,
+          'quantity' => $quantity,
+          'unit_price' => $unit_price,
+          'price_field_value_id' => $priceFieldValueID,
+          'tax_rate' => $taxRate,
+        );
+      }
+    }
+  }
+
+  // get this contribution line items
+  $currentLineItems = civicrm_api3('LineItem', 'get', array(
+    'sequential' => 1,
+    'contribution_id' => $contributionID,
+    'return' => "id,price_field_id",
+    'options' => array('limit' => 0),
+  ));
+
+  $currentLineItems = $currentLineItems['values'];
+  foreach($currentLineItems as $lineItem) {
+    if (empty($products[$lineItem['price_field_id']])) {
+      civicrm_api3('LineItem', 'delete', array(
+        'id' => $lineItem['id'],
+      ));
+    } else  {
+      $products[$lineItem['price_field_id']]['id'] = $lineItem['id'];
+    }
+  }
+
+  // build line items API array
+  $taxAmountTotal = 0;
+  $lineItemsParams = array();
+  $i = 0;
+  foreach($products as $priceFieldID => $values) {
+    $lineTotal = $values['unit_price'] * $values['quantity'];
+    $taxAmount = CRM_Contribute_BAO_Contribution_Utils::calculateTaxAmount($lineTotal, $values['tax_rate']);
+    $taxAmount = $taxAmount['tax_amount'];
+
+    $lineItemsParams[$i] = array(
+      'label' => $values['title'],
+      'price_field_id' => $priceFieldID,
+      'qty' => $values['quantity'],
+      'unit_price' => $values['unit_price'],
+      'line_total' => $values['unit_price'] * $values['quantity'],
+      'financial_type_id' =>  variable_get('commerce_civicrm_contribution_type'),
+      'price_field_value_id' => $values['price_field_value_id'],
+      'tax_amount' => $taxAmount,
+    );
+
+    if(!empty($values['id']))  {
+      $lineItemsParams[$i] = array_merge($lineItemsParams[$i], array('id' => $values['id']));
+    }
+
+    $i++;
+    $taxAmountTotal += $taxAmount;
+  }
+
+  $cid = _commerce_civicrm_get_cid($order);
+
+  $params = array(
+    'id' => $contributionID,
+    'contact_id' => $cid,
+    'total_amount' => $order_total,
+    'net_amount' => $order_total + $taxAmountTotal,
+    'tax_amount' => $taxAmountTotal,
+    'source' => $notes,
+    'contribution_status_id' => _commerce_civicrm_map_contribution_status($order->status),
+    'skipLineItem' => 1,
+    'api.line_item.create' => $lineItemsParams,
+  );
+  if (!empty($tax_field_id)) {
+    $params['custom_' . $tax_field_id] = $tax_total;
+  }
+  if (!empty($shipping_field_id)) {
+    $params['custom_' . $shipping_field_id] = $shipping_total;
+  }
+
+  $contribution = civicrm_api3('Contribution', 'create', $params);
+
+  // Log the error, but continue.
+  if (civicrm_error($contribution)) {
+    watchdog('commerce_civicrm', '_commerce_civicrm_add_contribution(): %error', array('%error' => $contribution['error_message']), WATCHDOG_ERROR);
+  }
+
+  // Log the error
+  if (civicrm_error($contribution)) {
+    watchdog('commerce_civicrm', 'commerce_civicrm_action_order_update(): %error', array('%error' => $contribution['error_message']), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Called when the user deleted an order
+ *
+ * @param $order
+ */
+function commerce_civicrm_action_order_delete($order)
+{
+  // initialize civicrm
+  if (!civicrm_initialize()) {
+    return;
+  }
+
+  _commerce_civicrm_cancel_civicrm_contribution($order);
+}
+
+/**
+ * set the status of civicrm contribution to 'canceled'
+ * when the related order get deleted.
+ *
+ * @param $order
+ */
+function _commerce_civicrm_cancel_civicrm_contribution($order) {
+  // get the corresponding contribution ID to the order that get updated
+  $contributionEntity = civicrm_api3('Contribution', 'get', array(
+    'sequential' => 1,
+    'return' => "id",
+    'invoice_id' => $order->order_id . "_dc",
+  ));
+
+  if (!empty($contributionEntity['id']))  {
+    $contributionID = $contributionEntity['id'];
+
+    $contribution = civicrm_api3('Contribution', 'create', array(
+      'id' => $contributionID,
+      'contribution_status_id' => _commerce_civicrm_map_contribution_status('canceled'),
+    ));
+
+    // Log the error
+    if (civicrm_error($contribution)) {
+      watchdog('commerce_civicrm', 'commerce_civicrm_action_order_delete(): %error', array('%error' => $contribution['error_message']), WATCHDOG_ERROR);
+    }
+  }
+}
+
+/**
+ * Called when the user create a new product
+ *
+ * @param $product
+ */
+function commerce_civicrm_action_product_insert($product)
+{
+  // initialize civicrm
+  if (!civicrm_initialize()) {
+    return;
+  }
+
+  // add new civicrm price field for the created product
+  _commerce_civicrm_add_update_pricefield($product);
+}
+
+/**
+ * Called when the user update a product
+ *
+ * @param $product
+ */
+function commerce_civicrm_action_product_update($product) {
+  // initialize civicrm
+  if (!civicrm_initialize()) {
+    return;
+  }
+
+  // update civicrm price field for the updated product
+  _commerce_civicrm_add_update_pricefield($product);
+}
+
+/**
+ * insert/update civicrm price field when creating/updating
+ * a drupal commerce product.
+ *
+ * @param $product
+ */
+function _commerce_civicrm_add_update_pricefield($product)  {
+  // get the total product price
+  $product_wrapper = entity_metadata_wrapper('commerce_product', $product);
+  $total = $product_wrapper->commerce_price->amount->value();
+  $productUnitPrice = $total / 100;
+
+  $params = array(
+    'sequential' => 1,
+    'label' => $product->title,
+    'name' => $product->sku,
+    'price_set_id' => variable_get('commerce_civicrm_price_set'),
+    'is_active' => 1,
+    'is_required' => 0,
+    'html_type' => "Text",
+    'is_display_amounts' => 1,
+    'visibility_id' => "public",
+    'option_amount' => array( 1 => $productUnitPrice),
+    'option_label' => array( 1 => $product->title),
+    'option_weight' =>  array( 1 => 1),
+    'option_description' => $product->sku,
+    'financial_type_id' => variable_get('commerce_civicrm_contribution_type'),
+  );
+
+  if (!empty($product->original->sku))  {
+    // get the price field ID if exist ( for update )
+    $priceField = civicrm_api3('PriceField', 'get', array(
+      'sequential' => 1,
+      'name' => $product->original->sku, // we use other original sku in case it's changed
+    ));
+
+    if (!empty($priceField['id']))  {
+      $params['id'] = $priceField['id'];
+    }
+
+    // create price field for the product
+    $priceField = civicrm_api3('PriceField', 'create', $params);
+
+    // Log the error if there is one
+    if (civicrm_error($priceField)) {
+      watchdog('commerce_civicrm', 'commerce_civicrm_action_product_civicrm_pricefield(): %error', array('%error' => $priceField['error_message']), WATCHDOG_ERROR);
+    }
+  }
+
+}
+
+
+/**
+ * Called when the user delete a product
+ *
+ * @param $product
+ */
+function commerce_civicrm_action_product_delete($product) {
+  // initialize civicrm
+  if (!civicrm_initialize()) {
+    return;
+  }
+
+  _commerce_civicrm_disable_price_field($product->sku);
+}
+
+/**
+ * disable the price field when the corresponding product
+ * get deleted on drupal side.
+ *
+ * @param $productSKU
+ */
+function _commerce_civicrm_disable_price_field($productSKU) {
+  $priceField = civicrm_api3('PriceField', 'get', array(
+    'sequential' => 1,
+    'name' => $productSKU,
+  ));
+
+  if (!empty($priceField['id']))  {
+    civicrm_api3('PriceField', 'get', array(
+      'id' => $priceField['id'],
+      'is_active' => 0,
+    ));
+  }
 }
